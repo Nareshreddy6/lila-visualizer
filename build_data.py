@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import json
 from collections import defaultdict
+import math
 
 BASE_PATH = r"C:\Users\nares\Desktop\lila-visualizer\data\player_data"
 OUTPUT_PATH = r"C:\Users\nares\Desktop\lila-visualizer\frontend\public"
@@ -38,6 +39,16 @@ def clean_match_id(match_id):
         s = s[:-2]
     return s
 
+def ts_to_ms(ts_val):
+    if hasattr(ts_val, 'value'):
+        return int(ts_val.value // 1_000_000)
+    if hasattr(ts_val, 'timestamp'):
+        return int(ts_val.timestamp() * 1000)
+    v = float(ts_val)
+    if v < 2e10:
+        return int(v * 1000)
+    return int(v)
+
 def load_all_data():
     all_records = []
     print("Loading all files...")
@@ -58,10 +69,7 @@ def load_all_data():
                 df['date'] = date_str
                 df['player_type'] = df['user_id'].apply(lambda uid: 'bot' if is_bot(uid) else 'human')
                 df['match_id_clean'] = df['match_id'].apply(clean_match_id)
-                # Convert ts to ms since epoch for ordering
-                df['ts_ms'] = df['ts'].apply(
-                    lambda t: int(t.value // 1_000_000) if hasattr(t, 'value') else int(float(t))
-                )
+                df['ts_ms'] = df['ts'].apply(ts_to_ms)
                 all_records.append(df)
             except Exception as e:
                 print(f"    Skipped {fname}: {e}")
@@ -69,24 +77,15 @@ def load_all_data():
     return pd.concat(all_records, ignore_index=True)
 
 def build_events(df, map_id):
-    """
-    Build events with a synthetic timeline (0-1000) per match.
-    Since all events in a match have nearly identical ts values,
-    we use row order to create a meaningful playback timeline.
-    """
     events = []
     skipped = 0
-
-    # Process per match to assign synthetic timeline
     for match_id, match_df in df.groupby('match_id_clean'):
         match_df = match_df.sort_values('ts_ms').reset_index(drop=True)
         n = len(match_df)
-
-        for i, row in match_df.iterrows():
+        for idx, (_, row) in enumerate(match_df.iterrows()):
             try:
                 px, py = world_to_pixel(float(row['x']), float(row['z']), map_id)
-                # Synthetic timeline: 0 to 1000 based on row position
-                synthetic_ts = int((match_df.index.get_loc(i) / max(n - 1, 1)) * 1000)
+                synthetic_ts = int((idx / max(n - 1, 1)) * 1000)
                 events.append({
                     "user_id": str(row['user_id']),
                     "match_id": str(match_id),
@@ -100,7 +99,6 @@ def build_events(df, map_id):
                 })
             except:
                 skipped += 1
-
     print(f"  {map_id}: {len(events)} events, {skipped} skipped")
     return events
 
@@ -113,6 +111,19 @@ def build_match_index(df):
         bots = int(group[group['player_type'] == 'bot']['user_id'].nunique())
         event_counts = {str(k): int(v) for k, v in group['event'].value_counts().to_dict().items()}
         total = int(len(group))
+        
+        # Per player stats
+        player_stats = []
+        for uid, pgroup in group.groupby('user_id'):
+            ptype = 'bot' if is_bot(uid) else 'human'
+            pevents = {str(k): int(v) for k, v in pgroup['event'].value_counts().to_dict().items()}
+            player_stats.append({
+                "user_id": str(uid),
+                "player_type": ptype,
+                "event_counts": pevents,
+                "total_events": int(len(pgroup)),
+            })
+
         matches.append({
             "match_id": str(match_id),
             "map_id": map_id,
@@ -121,7 +132,7 @@ def build_match_index(df):
             "bot_count": bots,
             "total_events": total,
             "event_counts": event_counts,
-            "duration_sec": total,  # use event count as proxy for match size
+            "player_stats": player_stats,
         })
     matches.sort(key=lambda m: (m['date'], m['match_id']))
     return matches
@@ -154,6 +165,83 @@ def build_heatmap_data(df):
             print(f"  {map_id}/{category}: {len(points)} points")
     return heatmaps
 
+def build_dead_zones(df):
+    """
+    Divide map into 32x32 grid cells.
+    Dead zones = cells never visited by any player.
+    Hot zones = cells visited most frequently.
+    """
+    dead_zones = {}
+    GRID = 32
+    CELL = 1024 // GRID
+
+    for map_id in df['map_id'].unique():
+        map_id = str(map_id)
+        if map_id not in MAP_CONFIG:
+            continue
+        map_df = df[df['map_id'] == map_id]
+        pos_df = map_df[map_df['event'].isin(['Position', 'BotPosition'])]
+
+        # Count visits per grid cell
+        cell_counts = defaultdict(int)
+        for _, row in pos_df.iterrows():
+            try:
+                px, py = world_to_pixel(float(row['x']), float(row['z']), map_id)
+                cell_x = int(px // CELL)
+                cell_y = int(py // CELL)
+                if 0 <= cell_x < GRID and 0 <= cell_y < GRID:
+                    cell_counts[(cell_x, cell_y)] += 1
+            except:
+                continue
+
+        # All possible cells
+        all_cells = [(x, y) for x in range(GRID) for y in range(GRID)]
+        max_count = max(cell_counts.values()) if cell_counts else 1
+
+        dead = []
+        hot = []
+        for cx, cy in all_cells:
+            count = cell_counts.get((cx, cy), 0)
+            px = cx * CELL + CELL // 2
+            py = cy * CELL + CELL // 2
+            if count == 0:
+                dead.append([px, py])
+            elif count > max_count * 0.5:
+                hot.append([px, py, count])
+
+        dead_zones[map_id] = {
+            "dead": dead,
+            "hot": hot,
+            "grid_size": CELL,
+            "total_cells": GRID * GRID,
+            "visited_cells": len(cell_counts),
+            "dead_cell_count": len(dead),
+        }
+        print(f"  {map_id}: {len(dead)} dead zones, {len(hot)} hot zones out of {GRID*GRID} cells")
+
+    return dead_zones
+
+def build_player_index(df):
+    """Build index of all human players across all matches"""
+    players = {}
+    human_df = df[df['player_type'] == 'human']
+    
+    for uid, group in human_df.groupby('user_id'):
+        matches_played = group['match_id_clean'].nunique()
+        maps_played = group['map_id'].unique().tolist()
+        event_counts = {str(k): int(v) for k, v in group['event'].value_counts().to_dict().items()}
+        players[str(uid)] = {
+            "user_id": str(uid),
+            "matches_played": int(matches_played),
+            "maps_played": maps_played,
+            "total_events": int(len(group)),
+            "event_counts": event_counts,
+            "match_ids": group['match_id_clean'].unique().tolist(),
+        }
+    
+    print(f"  Built index for {len(players)} human players")
+    return players
+
 def main():
     os.makedirs(OUTPUT_PATH, exist_ok=True)
     df = load_all_data()
@@ -170,6 +258,16 @@ def main():
     with open(os.path.join(OUTPUT_PATH, "heatmaps.json"), "w") as f:
         json.dump({k: dict(v) for k, v in heatmaps.items()}, f)
 
+    print("\nBuilding dead zones...")
+    dead_zones = build_dead_zones(df)
+    with open(os.path.join(OUTPUT_PATH, "deadzones.json"), "w") as f:
+        json.dump(dead_zones, f)
+
+    print("\nBuilding player index...")
+    players = build_player_index(df)
+    with open(os.path.join(OUTPUT_PATH, "players.json"), "w") as f:
+        json.dump(players, f)
+
     print("\nBuilding events per map...")
     for map_id in ["AmbroseValley", "GrandRift", "Lockdown"]:
         map_df = df[df['map_id'] == map_id]
@@ -182,26 +280,11 @@ def main():
     with open(os.path.join(OUTPUT_PATH, "map_config.json"), "w") as f:
         json.dump(MAP_CONFIG, f)
 
-    print("\n✅ Done!")
-
-    # Verify
-    print("\n--- Verification: best match ---")
-    e = json.load(open(os.path.join(OUTPUT_PATH, "events_AmbroseValley.json")))
-    m = json.load(open(os.path.join(OUTPUT_PATH, "matches.json")))
-    good = [x for x in m if x['map_id'] == 'AmbroseValley' and x['human_count'] >= 2 and x['total_events'] >= 50]
-    good.sort(key=lambda x: x['total_events'], reverse=True)
-    if good:
-        best = good[0]
-        mid = best['match_id']
-        evts = [x for x in e if x['match_id'] == mid]
-        pos = [x for x in evts if x['event'] in ['Position', 'BotPosition']]
-        ts_vals = [x['ts'] for x in evts]
-        print(f"Match: {mid}")
-        print(f"Events: {len(evts)} | Positions: {len(pos)}")
-        print(f"Humans: {best['human_count']} | Bots: {best['bot_count']}")
-        print(f"TS range: {min(ts_vals)} -> {max(ts_vals)}")
-        print(f"Players: {set(x['user_id'] for x in evts)}")
-        print(f"\n✅ Search for '{mid[:18]}' in the sidebar and click it!")
+    print("\n✅ All done!")
+    print(f"\nFiles in {OUTPUT_PATH}:")
+    for f in os.listdir(OUTPUT_PATH):
+        size = os.path.getsize(os.path.join(OUTPUT_PATH, f))
+        print(f"  {f}: {size/1024:.1f} KB")
 
 if __name__ == "__main__":
     main()
