@@ -31,33 +31,8 @@ A web-based analytics tool for Level Designers to explore player behavior across
 | ▶ Timeline Playback | Watch a match unfold event by event |
 
 ## 🗂 Project Structure
-lila-visualizer/
-├── build_data.py              ← Python ETL pipeline
-├── data/
-│   └── player_data/           ← Raw parquet files (not committed)
-│       ├── February_10/
-│       ├── February_11/
-│       ├── February_12/
-│       ├── February_13/
-│       ├── February_14/
-│       └── minimaps/
-└── frontend/
-    ├── public/                ← Pre-processed JSON data files
-    │   ├── matches.json
-    │   ├── heatmaps.json
-    │   ├── deadzones.json
-    │   ├── players.json
-    │   ├── events_AmbroseValley.json
-    │   ├── events_GrandRift.json
-    │   └── events_Lockdown.json
-    └── src/
-        ├── App.jsx
-        └── components/
-            ├── Sidebar.jsx
-            ├── MapView.jsx
-            ├── Timeline.jsx
-            └── StatsPanel.jsx
-            
+<img width="768" height="658" alt="image" src="https://github.com/user-attachments/assets/f61c458b-88c0-4530-90c9-db84ae0b7089" />
+
 ## 🚀 Run Locally
 ### Prerequisites
 - Python 3.11+
